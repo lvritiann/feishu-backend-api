@@ -43,6 +43,9 @@ const TENCENT_APP_SECRET = process.env.TENCENT_APP_SECRET || '';
 const TENCENT_SPREADSHEET_ID = process.env.TENCENT_SPREADSHEET_ID || '';
 const TENCENT_API_BASE = 'https://open.feishu.cn/open-apis';
 
+// 前端入口短链接：/go 或 /apply → 302 跳转到前端页面（前端地址变了只改这个变量）
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://763779aeaeee40f0a68814fcf9994c56.app.workbuddy.link';
+
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -299,6 +302,13 @@ const server = http.createServer((req, res) => {
         { id: '13', name: '王华宫站' }, { id: '14', name: '照金站' }, { id: '15', name: '天汉水城站' },
       ],
     });
+    return;
+  }
+
+  // 前端入口短链接：/go 或 /apply → 302 跳转到前端页面
+  if ((url === '/go' || url === '/apply') && req.method === 'GET') {
+    res.writeHead(302, { 'Location': FRONTEND_URL });
+    res.end();
     return;
   }
 
