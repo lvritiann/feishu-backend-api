@@ -44,7 +44,7 @@ const TENCENT_SPREADSHEET_ID = process.env.TENCENT_SPREADSHEET_ID || '';
 const TENCENT_API_BASE = 'https://open.feishu.cn/open-apis';
 
 // 前端入口短链接：/go 或 /apply → 302 跳转到前端页面（前端地址变了只改这个变量）
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://763779aeaeee40f0a68814fcf9994c56.app.workbuddy.link';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://nonoil-forecast-42019.app.workbuddy.host/';
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -198,6 +198,11 @@ async function kdocsAddRow(rowData) {
   return result;
 }
 
+// 重复写入拦截：同一油站 + 相同申报数值，60s 内连续重复提交直接拦截（防双击/网络重试造成的飞书重复写入）
+const DEDUPE_WINDOW_MS = 60 * 1000;
+const recentSubs = [];
+const round2 = (v) => Math.round((parseFloat(String(v)) || 0) * 100) / 100;
+
 const server = http.createServer((req, res) => {
   const url = req.url || '/';
 
@@ -226,6 +231,21 @@ const server = http.createServer((req, res) => {
           sendJson(res, 400, { ok: false, error: '缺少必填字段' });
           return;
         }
+
+        // 重复写入拦截：同站 + 相同数值，60s 内连续重复提交 → 拦截（不影响修正后重新申报）
+        const now = Date.now();
+        while (recentSubs.length && now - recentSubs[0].ts > DEDUPE_WINDOW_MS) recentSubs.shift();
+        const subKey = `${stationId}|${round2(nonOil)}|${round2(tobacco ?? 0)}|${round2(offload ?? 0)}`;
+        if (recentSubs.some((r) => r.key === subKey && now - r.ts < DEDUPE_WINDOW_MS)) {
+          console.log('[apply/submit] 拦截重复提交:', subKey);
+          sendJson(res, 409, {
+            ok: false,
+            duplicate: true,
+            error: '检测到重复提交（60 秒内相同内容已写入），已拦截。如确需修改请调整数值后重新提交。',
+          });
+          return;
+        }
+        recentSubs.push({ key: subKey, ts: now });
 
         let rowData;
         if (FEISHU_SPREADSHEET_ID) {
