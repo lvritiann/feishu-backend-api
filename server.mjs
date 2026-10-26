@@ -268,6 +268,10 @@ function beijingTimeString(d = new Date()) {
          `${p(t.getUTCHours())}:${p(t.getUTCMinutes())}:${p(t.getUTCSeconds())}`;
 }
 
+// 代码版本号：每次改动后端行为时递增，/api/version 可查询线上是否已重建到本版
+// 2026-10-26.2 = 同站就地更新 + 站名归一 + 填报时间东八区
+const CODE_VERSION = '2026-10-26.2';
+
 // 重复写入拦截：同一油站 + 相同申报数值，60s 内连续重复提交直接拦截（防双击/网络重试造成的飞书重复写入）
 const DEDUPE_WINDOW_MS = 60 * 1000;
 const recentSubs = [];
@@ -374,6 +378,15 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 版本探测端点：确认线上（Render）是否已重建到最新代码
+  if (url === '/api/version' && req.method === 'GET') {
+    sendJson(res, 200, {
+      version: CODE_VERSION,
+      features: { upsertByStation: true, stationNameNormalize: true, beijingTime: true },
+    });
+    return;
+  }
+
   // 飞书配置端点
   if (url === '/api/feishu/config' && req.method === 'GET') {
     sendJson(res, 200, {
@@ -382,6 +395,7 @@ const server = http.createServer((req, res) => {
       bitableAppId: FEISHU_BITABLE_APP_ID,
       bitableTableId: FEISHU_BITABLE_TABLE_ID,
       platform: DOC_PLATFORM,
+      version: CODE_VERSION,
     });
     return;
   }
