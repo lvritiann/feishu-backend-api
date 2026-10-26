@@ -62,14 +62,14 @@ const MIME = {
   '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
 };
 
-// 站列表（供多维表格显示用）
-const STATIONS = [
-  { id: '1', name: '秦岭站' }, { id: '2', name: '宁陕站' }, { id: '3', name: '洋县站' },
-  { id: '4', name: '汉中华山站' }, { id: '5', name: '富平站' }, { id: '6', name: '韩城站' },
-  { id: '7', name: '富县站' }, { id: '8', name: '南沙站' }, { id: '9', name: '华山站' },
-  { id: '10', name: '白河站' }, { id: '11', name: '旬阳站' }, { id: '12', name: '略阳站' },
-  { id: '13', name: '王华宫站' }, { id: '14', name: '照金站' }, { id: '15', name: '天汉水城站' },
-];
+// 站列表与站名归一化：抽到 stationName.mjs（可被单测覆盖）
+import {
+  STATIONS,
+  stationKeyOf,
+  canonicalStationName,
+  locateStationRow,
+} from './stationName.mjs';
+
 
 function sendJson(res, code, obj) {
   const body = JSON.stringify(obj);
@@ -140,8 +140,15 @@ async function feishuAddRow(rowData, opts = {}) {
     };
 
     const kw = opts.monthLabel ? String(opts.monthLabel) : ''; // 例：'10月'
+    // 优先精确匹配「{kw}申报」，再回退到「标题含 kw」，避免命中「11月汇总」这类同月别名表
+    const exactTitle = `${kw}申报`;
+    const pickSheet = (list) =>
+      kw
+        ? (list.find((s) => String(s.title || '').trim() === exactTitle) ||
+           list.find((s) => String(s.title || '').includes(kw)))
+        : list[0];
     let sheets = await readMeta();
-    let target = kw ? sheets.find((s) => String(s.title || '').includes(kw)) : sheets[0];
+    let target = pickSheet(sheets);
 
     // 当月工作表不存在 → 自动新建，并按申报月份写表头（保证列结构与写入顺序一致）
     if (!target && kw) {
@@ -168,43 +175,52 @@ async function feishuAddRow(rowData, opts = {}) {
       });
       console.log(`[apply/submit] 已自动新建工作表「${title}」并写入表头`);
       sheets = await readMeta();
-      target = sheets.find((s) => String(s.title || '').includes(kw));
+      target = pickSheet(sheets);
     }
 
-    const wsId = target?.sheetId || sheets[0]?.sheetId;
+    // 有申报月份却选不到工作表 → 直接报错，绝不静默回退到 sheets[0]（否则会把 11 月写进 10 月表）
+    if (!target) throw new Error(`未找到/未能创建「${kw}」工作表，为避免写错表已中止`);
+    const wsId = target.sheetId;
     if (!wsId) throw new Error('无法获取飞书工作表 ID');
 
-    // 2. 读取 A 列（序号）确定最后有数据的行
-    const readRes = await fetch(`${FEISHU_API_BASE}/sheets/v2/spreadsheets/${SP}/values/${wsId}!A1:A200`, {
+    // 2. 读取 A:J（序号 + 站名 + 数值），按站名定位已存在行
+    //    —— 同站重复提交必须「就地更新」，不能再追加新行（10 月表照金站曾被写 3 行）
+    const readRes = await fetch(`${FEISHU_API_BASE}/sheets/v2/spreadsheets/${SP}/values/${wsId}!A1:J200`, {
       headers: { 'Authorization': `Bearer ${token}` },
     });
     const readData = await readRes.json();
     const rows = readData.data?.valueRange?.values || [];
-    let lastFilled = 1; // 第1行是表头
-    for (let i = 0; i < rows.length; i++) {
-      if (rows[i] && rows[i][0] != null && String(rows[i][0]).trim() !== '') lastFilled = i + 1;
-    }
-    const nextRow = lastFilled + 1;
 
-    // 序号自动填充（数据行号 = nextRow - 1）
-    if (Array.isArray(rowData) && (rowData[0] === '' || rowData[0] == null)) {
-      rowData[0] = String(nextRow - 1);
+    const wantKey = stationKeyOf(rowData[1]);
+    const { targetRow, lastFilled } = locateStationRow(rows, wantKey);
+
+    const mode = targetRow > 0 ? 'update' : 'insert';
+    const writeRow = targetRow > 0 ? targetRow : lastFilled + 1;
+    // 更新时保留原序号（避免与历史行号错位）；新增时按行号自动补
+    if (Array.isArray(rowData)) {
+      const oldNo = targetRow > 0 ? (rows[targetRow - 1] || [])[0] : null;
+      if (oldNo != null && String(oldNo).trim() !== '') {
+        rowData[0] = String(oldNo).trim();
+      } else if (rowData[0] === '' || rowData[0] == null) {
+        rowData[0] = String(writeRow - 1);
+      }
     }
 
-    // 3. PUT 写入下一行（range 放 body，避免 URL 中 : 和 ! 编码问题）
+    // 3. PUT 写入目标行（range 放 body，避免 URL 中 : 和 ! 编码问题）
     const writeRes = await fetch(`${FEISHU_API_BASE}/sheets/v2/spreadsheets/${SP}/values`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
       body: JSON.stringify({
         valueRange: {
-          range: `${wsId}!A${nextRow}:J${nextRow}`,
+          range: `${wsId}!A${writeRow}:J${writeRow}`,
           values: [rowData],
         },
       }),
     });
     const writeData = await writeRes.json();
     if (writeData.code !== 0) throw new Error(`飞书写入失败: ${writeData.msg}`);
-    return writeData;
+    console.log(`[apply/submit] ${mode === 'update' ? '就地更新' : '新增'}「${target.title}」第 ${writeRow} 行（站名键 ${wantKey}）`);
+    return { mode, row: writeRow, sheet: target.title };
   }
 
   // 备选：多维表格模式
@@ -234,6 +250,22 @@ async function kdocsAddRow(rowData) {
   const result = await response.json();
   if (!result.success && result.code !== 0) throw new Error(result.message || 'Kdocs API 错误');
   return result;
+}
+
+/**
+ * 东八区时间字符串（YYYY/M/D HH:mm:ss）
+ *
+ * ⚠️ 必须显式 +8h，不能用 `new Date().toLocaleString('zh-CN')`：
+ * 该方法取「服务器本地时区」，而 Render / 多数云容器默认 TZ=UTC，
+ * 会把北京时间减 8 小时写进飞书（如北京 20:37 记成 12:37），
+ * 且北京时间 0:00~7:59 的提交会被记成「前一天」，按日期核对时会误判。
+ * 这里用 getUTC* + 固定偏移，既不依赖容器 TZ，也不依赖 Node 的 ICU 时区库。
+ */
+function beijingTimeString(d = new Date()) {
+  const t = new Date(d.getTime() + 8 * 3600 * 1000);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${t.getUTCFullYear()}/${t.getUTCMonth() + 1}/${t.getUTCDate()} ` +
+         `${p(t.getUTCHours())}:${p(t.getUTCMinutes())}:${p(t.getUTCSeconds())}`;
 }
 
 // 重复写入拦截：同一油站 + 相同申报数值，60s 内连续重复提交直接拦截（防双击/网络重试造成的飞书重复写入）
@@ -290,9 +322,9 @@ const server = http.createServer((req, res) => {
           // 普通表格模式（sheet）：10 列，顺序必须与目标工作表表头严格一致——
           // 序号 / 站名 / 上月实际(万元) / 非油申报 / 烟草申报 / 去化 / 综合毛利率% / 判定 / 填报时间 / 申报理由
           const mLabel = declMonth ? `${declMonth}月` : '';
-          // 站名优先用前端传来的（与系统站名一致），统一补「站」后缀以对齐历史行；回退服务端站表
-          const rawName = stationName || (STATIONS.find(s => s.id === stationId)?.name) || `站${stationId}`;
-          const stationNameFinal = /站$/.test(rawName) ? rawName : `${rawName}站`;
+          // 站名以 stationId 查服务端站表为准（stationName 仅作兜底），
+          // 保证「汉中/汉中华山」「玉华宫/王华宫」等同站异名始终写成同一个名字，不会分裂成两行
+          const stationNameFinal = canonicalStationName(stationId, stationName);
           // 判定：兼容中文直传（正常/偏低/偏高）与英文枚举（ok/low/high）
           const judgmentMap = { 'ok': '正常', 'low': '偏低', 'high': '偏高' };
           const judgmentCn = judgmentMap[String(judgment)] ?? String(judgment ?? '');
@@ -305,7 +337,7 @@ const server = http.createServer((req, res) => {
             String(offload ?? 0),                        // mLabel 去化
             String(marginRate ?? ''),                    // 综合毛利率%
             judgmentCn,                                  // 判定
-            new Date().toLocaleString('zh-CN'),          // 填报时间
+            beijingTimeString(),                          // 填报时间（东八区，显式 +8h）
             String(reason ?? ''),                        // 申报理由
           ];
           console.log(`[apply/submit] 目标工作表: ${mLabel} / 站: ${stationNameFinal}`);
@@ -325,13 +357,15 @@ const server = http.createServer((req, res) => {
           rowData = [];
         }
 
+        let writeInfo = null;
         if (DOC_PLATFORM === 'feishu') {
-          // 按申报月份定位/自动新建对应工作表（如「10月申报」）
-          await feishuAddRow(rowData, { monthLabel: declMonth ? `${declMonth}月` : '' });
+          // 按申报月份定位/自动新建对应工作表（如「11月申报」）；同站已有行则就地更新
+          writeInfo = await feishuAddRow(rowData, { monthLabel: declMonth ? `${declMonth}月` : '' });
         } else {
-          await kdocsAddRow(rowData);
+          writeInfo = await kdocsAddRow(rowData);
         }
-        sendJson(res, 200, { ok: true });
+        // 把「更新/新增 + 工作表 + 行号」回传前端，方便站点确认是覆盖还是新建
+        sendJson(res, 200, { ok: true, ...(writeInfo && typeof writeInfo === 'object' ? writeInfo : {}) });
       } catch (e) {
         console.error('[apply/submit] error:', e.message);
         sendJson(res, 500, { ok: false, error: e.message });
